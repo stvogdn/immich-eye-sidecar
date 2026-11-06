@@ -12,6 +12,11 @@ through the Immich API, pulls each asset's preview JPEG, shells out to the
 **It never deletes, archives, rates or untags anything.** The only write is
 adding tags whose name starts with the configured prefix.
 
+Status: **beta**, built and running against a 110k-asset library. Written
+because no Immich ↔ Eye integration existed; MIT-licensed, issues welcome.
+The CLI and model weights are Desert Ant Labs' own — see
+[THIRD_PARTY.md](THIRD_PARTY.md).
+
 ## Requirements
 
 | Piece | Where | Why |
@@ -34,6 +39,29 @@ export PATH="$HOME/.local/bin:$PATH"
 ./eye_sidecar.py                          # walk the whole library, incremental
 ./eye_sidecar.py --report                 # state totals + recent failures
 ```
+
+## Quick start on any host
+
+```bash
+# 1. the CLI + a decoder
+curl -fsSL https://raw.githubusercontent.com/Desert-Ant-Labs/desert-ant-cli/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+sudo apt install -y ffmpeg          # or: brew install ffmpeg
+
+# 2. prove the model runs before involving Immich
+desertant eye some-photo.jpg --json
+
+# 3. point the sidecar at your server
+git clone https://github.com/stvogdn/immich-eye-sidecar && cd immich-eye-sidecar
+export IMMICH_URL=https://immich.example.com
+export IMMICH_API_KEY=...           # Immich -> Account Settings -> API Keys
+export STATE_DB=./state.db
+./eye_sidecar.py --dry-run --limit 5
+./eye_sidecar.py --limit 5          # then drop --limit when it looks right
+```
+
+Run it from anywhere that can reach the Immich API. Running it *on* the Immich
+host (as below) just saves the preview round trip.
 
 ## What gets tagged
 
@@ -106,6 +134,11 @@ by that user.
   library drains in roughly four days of background work, newest first.
 - Model load is ~3 s per invocation, so keep `--batch` well above 1: batches of
   24 amortise it to nothing.
+
+## Licence
+
+The sidecar's own code is MIT (see [LICENSE](LICENSE)). It drives Desert Ant
+Labs' CLI and weights, which have their own licence — [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## Tests
 
