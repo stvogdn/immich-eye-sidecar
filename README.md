@@ -77,6 +77,35 @@ Deliberately **not** written: `photo`, `sharp`, `people`, `keeper`/`forgettable`
 as a keep-or-delete verdict, `reference`, `low_content` — they are always-true
 or judgement calls, and a sidecar should not make those.
 
+### Percentile buckets (the only tags ever removed)
+
+The aesthetic score is a *relative* rank, not a grade: over a real library it
+spread 0 → 0.99 with a median near 0.33, so a fixed cutoff is meaningless. Each
+pass therefore recomputes the library's own distribution and maintains three
+mutually exclusive buckets:
+
+| Tag | Rule | Meaning |
+|---|---|---|
+| `eye:aesthetic-top1` | aesthetic ≥ p99 | best 1% |
+| `eye:aesthetic-top10` | aesthetic ≥ p90 | best 10% |
+| `eye:low-quality` | aesthetic ≤ p10 | worst 10% |
+
+Details that matter:
+
+- **They are recomputed, not accumulated.** As the backlog drains the cutoffs
+  move, so an asset that leaves a bucket has the tag *removed* (the only place
+  this tool writes a delete). It only ever removes tags it added itself, and it
+  tracks which bucket it applied per asset in the state DB.
+- **Drift gate.** Existing buckets are only rewritten when a threshold moves
+  more than 0.02 (`BUCKET_DRIFT`), so a library in the middle of a first pass
+  does not churn. Newly scored assets are always bucketed — they have no bucket
+  yet, so the diff applies to them regardless of drift.
+- **First run needs 200 scored assets** (`BUCKET_MIN_SAMPLES`); below that the
+  percentiles are noise and the pass is skipped.
+- Buckets need no model run: `--rebucket` re-tags from the scores already in the
+  state DB in seconds, `--rebucket --dry-run` prints what would change,
+  `--bucket-force` ignores the drift gate, `--no-buckets` disables the pass.
+
 ## Options
 
 ```

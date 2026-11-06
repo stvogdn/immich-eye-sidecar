@@ -128,6 +128,68 @@ SENSITIVE_TAGS = (
 
 KEEPER_SCORE = 0.8
 
+# ---------------------------------------------------------------------------
+# Percentile buckets
+# ---------------------------------------------------------------------------
+#
+# The aesthetic score is a *relative* rank, not an absolute grade: measured over
+# a real library it spreads from 0 to 0.99 with a median near 0.33, so a fixed
+# cutoff means nothing. Buckets are therefore recomputed from the library's own
+# distribution each pass, and they are the only tags here that get *removed*
+# as well as added.
+
+BUCKET_TAGS = {
+    "top1": "aesthetic-top1",
+    "top10": "aesthetic-top10",
+    "low": "low-quality",
+}
+BUCKET_MIN_SAMPLES = 200      # below this the percentiles are noise
+BUCKET_DRIFT = 0.02           # re-tag only when a threshold moves this much
+BUCKET_P10, BUCKET_P90, BUCKET_P99 = 0.10, 0.90, 0.99
+
+
+def percentile(values: list[float], q: float) -> float:
+    """Nearest-rank percentile, no interpolation — good enough for a cutoff."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, round(q * (len(ordered) - 1))))
+    return ordered[idx]
+
+
+@dataclass
+class Buckets:
+    low: float
+    top10: float
+    top1: float
+    n: int
+
+    @classmethod
+    def from_scores(cls, scores: list[float]) -> "Buckets | None":
+        if len(scores) < BUCKET_MIN_SAMPLES:
+            return None
+        ordered = sorted(scores)
+        return cls(
+            low=percentile(ordered, BUCKET_P10),
+            top10=percentile(ordered, BUCKET_P90),
+            top1=percentile(ordered, BUCKET_P99),
+            n=len(ordered),
+        )
+
+    def as_dict(self) -> dict:
+        return {"low": self.low, "top10": self.top10, "top1": self.top1, "n": self.n}
+
+
+def bucket_for(score: float, b: Buckets) -> str | None:
+    """Which single bucket an aesthetic score falls in, if any."""
+    if score >= b.top1:
+        return "top1"
+    if score >= b.top10:
+        return "top10"
+    if score <= b.low:
+        return "low"
+    return None
+
 
 def slug(name: str) -> str:
     """Turn a model tag into something safe for an Immich tag name."""
@@ -266,6 +328,9 @@ class Immich:
     def add_tag_to_assets(self, tag_id: str, asset_ids: list[str]) -> None:
         self._request("PUT", f"/api/tags/{tag_id}/assets", {"ids": asset_ids})
 
+    def remove_tag_from_assets(self, tag_id: str, asset_ids: list[str]) -> None:
+        self._request("DELETE", f"/api/tags/{tag_id}/assets", {"ids": asset_ids})
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -280,6 +345,10 @@ CREATE TABLE IF NOT EXISTS processed (
     scores        TEXT,
     model         TEXT,
     processed_at  TEXT
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 CREATE TABLE IF NOT EXISTS failures (
     asset_id   TEXT PRIMARY KEY,
@@ -299,6 +368,8 @@ class State:
         cols = {row[1] for row in self.db.execute("PRAGMA table_info(processed)")}
         if "fingerprint" not in cols:
             self.db.execute("ALTER TABLE processed ADD COLUMN fingerprint TEXT")
+        if "buckets" not in cols:
+            self.db.execute("ALTER TABLE processed ADD COLUMN buckets TEXT")
         self.db.commit()
 
     def seen(self, asset_id: str) -> str | None:
@@ -327,6 +398,38 @@ class State:
             "error=excluded.error, attempts=failures.attempts+1, last_at=excluded.last_at",
             (asset_id, updated_at, error[:500], now()),
         )
+        self.db.commit()
+
+    # -- percentile buckets ------------------------------------------------
+    def aesthetic_scores(self) -> list[tuple[str, float]]:
+        """(asset_id, aesthetic) for every processed asset that has a score."""
+        out = []
+        for asset_id, raw in self.db.execute(
+                "SELECT asset_id, scores FROM processed WHERE scores IS NOT NULL"):
+            try:
+                score = json.loads(raw).get("aesthetic")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(score, (int, float)):
+                out.append((asset_id, float(score)))
+        return out
+
+    def bucket_of(self, asset_id: str) -> str | None:
+        row = self.db.execute(
+            "SELECT buckets FROM processed WHERE asset_id=?", (asset_id,)).fetchone()
+        return row[0] if row and row[0] else None
+
+    def set_bucket(self, asset_id: str, bucket: str | None) -> None:
+        self.db.execute("UPDATE processed SET buckets=? WHERE asset_id=?", (bucket, asset_id))
+
+    def meta_get(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def meta_set(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value))
         self.db.commit()
 
     def totals(self) -> dict:
@@ -418,6 +521,8 @@ class Config:
     include_scenes: bool = True
     max_pages: int | None = None
     kuma_push_url: str | None = None
+    buckets: bool = True
+    bucket_force: bool = False
     log: object = field(default=sys.stdout)
 
 
@@ -434,6 +539,83 @@ def kuma_ping(url: str | None, ok: bool, msg: str) -> None:
         urllib.request.urlopen(f"{url}{sep}{query}", timeout=15).read()
     except Exception as exc:  # monitoring must never fail the run
         log(f"kuma push failed: {exc}")
+
+
+def rebucket(immich: Immich, state: State, cfg: Config) -> tuple[int, int]:
+    """Bring the percentile bucket tags in line with the library's own spread.
+
+    Runs after each pass. Nothing happens until there are enough scored assets
+    for percentiles to mean something, and nothing is rewritten unless a
+    threshold has drifted — the backlog drains over hours, so the cutoffs move
+    early and settle late.
+    """
+    pairs = state.aesthetic_scores()
+    buckets = Buckets.from_scores([score for _, score in pairs])
+    if buckets is None:
+        log(f"buckets: {len(pairs)} scored assets, need {BUCKET_MIN_SAMPLES} — skipped")
+        return (0, 0)
+
+    previous = state.meta_get("buckets")
+    if previous and not cfg.bucket_force:
+        try:
+            old = json.loads(previous)
+            drift = max(abs(buckets.low - old["low"]),
+                        abs(buckets.top10 - old["top10"]),
+                        abs(buckets.top1 - old["top1"]))
+            if drift < BUCKET_DRIFT:
+                log(f"buckets: unchanged (drift {drift:.3f} < {BUCKET_DRIFT}); "
+                    f"p10 {buckets.low:.3f} p90 {buckets.top10:.3f} p99 {buckets.top1:.3f}")
+                return (0, 0)
+        except (ValueError, KeyError):
+            pass
+
+    adds: dict[str, list[str]] = {}
+    removes: dict[str, list[str]] = {}
+    for asset_id, score in pairs:
+        want = bucket_for(score, buckets)
+        have = state.bucket_of(asset_id)
+        if want == have:
+            continue
+        if want:
+            adds.setdefault(want, []).append(asset_id)
+        if have:
+            removes.setdefault(have, []).append(asset_id)
+
+    added = sum(len(v) for v in adds.values())
+    removed = sum(len(v) for v in removes.values())
+    log(f"buckets: p10 {buckets.low:.3f} p90 {buckets.top10:.3f} p99 {buckets.top1:.3f} "
+        f"over {buckets.n} assets — {added} to add, {removed} to remove"
+        + (" (dry run)" if cfg.dry_run else ""))
+
+    if cfg.dry_run:
+        for name, ids in adds.items():
+            log(f"  + {BUCKET_TAGS[name]}: {len(ids)}")
+        for name, ids in removes.items():
+            log(f"  - {BUCKET_TAGS[name]}: {len(ids)}")
+        return (added, removed)
+
+    for name, ids in adds.items():
+        tag_name = f"{cfg.prefix}:{BUCKET_TAGS[name]}"
+        try:
+            tag_id = immich.ensure_tag(tag_name)
+            immich.add_tag_to_assets(tag_id, ids)
+            for asset_id in ids:
+                state.set_bucket(asset_id, name)
+        except Exception as exc:
+            log(f"bucket add failed for {tag_name} ({len(ids)}): {exc}")
+    for name, ids in removes.items():
+        tag_name = f"{cfg.prefix}:{BUCKET_TAGS[name]}"
+        try:
+            tag_id = immich.ensure_tag(tag_name)
+            immich.remove_tag_from_assets(tag_id, ids)
+            for asset_id in ids:
+                if state.bucket_of(asset_id) == name:
+                    state.set_bucket(asset_id, None)
+        except Exception as exc:
+            log(f"bucket remove failed for {tag_name} ({len(ids)}): {exc}")
+    state.db.commit()
+    state.meta_set("buckets", json.dumps(buckets.as_dict()))
+    return (added, removed)
 
 
 def run(cfg: Config) -> int:
@@ -560,8 +742,17 @@ def run(cfg: Config) -> int:
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+    bucket_counts = (0, 0)
+    if cfg.buckets:
+        try:
+            bucket_counts = rebucket(immich, state, cfg)
+        except Exception as exc:
+            log(f"bucket pass failed: {exc}")
+            failed += 1
+
     summary = (f"examined={examined} processed={processed} skipped={skipped} "
-               f"failed={failed} dry_run={cfg.dry_run}")
+               f"failed={failed} buckets +{bucket_counts[0]}/-{bucket_counts[1]} "
+               f"dry_run={cfg.dry_run}")
     log(f"done: {summary}")
     top = sorted(tag_counts.items(), key=lambda kv: -kv[1])[:12]
     if top:
@@ -617,6 +808,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-scenes", action="store_true", help="skip scene tags entirely")
     ap.add_argument("--prefix", help="tag namespace (default 'eye')")
     ap.add_argument("--report", action="store_true", help="print state summary and exit")
+    ap.add_argument("--no-buckets", action="store_true",
+                    help="skip the percentile bucket pass (eye:aesthetic-top1/top10, eye:low-quality)")
+    ap.add_argument("--rebucket", action="store_true",
+                    help="run only the percentile bucket pass and exit")
+    ap.add_argument("--bucket-force", action="store_true",
+                    help="re-apply buckets even when the thresholds have not drifted")
     args = ap.parse_args(argv)
 
     api_key = load_api_key()
@@ -639,7 +836,16 @@ def main(argv: list[str] | None = None) -> int:
         include_scenes=not args.no_scenes,
         max_pages=args.max_pages,
         kuma_push_url=env("KUMA_PUSH_URL"),
+        buckets=not args.no_buckets and env("BUCKETS", "1") != "0",
+        bucket_force=args.bucket_force,
     )
+
+    if args.rebucket:
+        immich = Immich(cfg.immich_url, cfg.api_key)
+        state = State(cfg.state_db)
+        added, removed = rebucket(immich, state, cfg)
+        log(f"rebucket done: +{added} / -{removed}")
+        return 0
 
     if args.report:
         state = State(cfg.state_db)
