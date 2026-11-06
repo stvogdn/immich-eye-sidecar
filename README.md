@@ -133,8 +133,8 @@ your home directory.
   photos in 110 s end to end, including Immich API round trips and 60-ish tag
   writes.
 - The timer runs a pass every 20 minutes with `--limit 400`, which is ~18
-  minutes of work per pass — about **1,200 photos/hour**, so a 110k-asset
-  library drains in roughly four days of background work, newest first.
+  minutes of work per pass — about **1,200 photos/hour**, so a 30k-image
+  library drains in roughly a day of background work, newest first.
 - Model load is ~3 s per invocation, so keep `--batch` well above 1: batches of
   24 amortise it to nothing.
 
