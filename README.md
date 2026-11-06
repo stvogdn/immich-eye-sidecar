@@ -96,6 +96,17 @@ The unit runs as the `sogden1` user so it inherits `~/.local/bin/desertant`
 and its cached weights; `STATE_DB=/var/lib/immich-eye/state.db` must be writable
 by that user.
 
+## Throughput (measured on pluto, 2026-11-06)
+
+- **≈2.75 s per photo** single-threaded, CPU only (LiteRT build, no GPU): 40
+  photos in 110 s end to end, including Immich API round trips and 60-ish tag
+  writes.
+- The timer runs a pass every 20 minutes with `--limit 400`, which is ~18
+  minutes of work per pass — about **1,200 photos/hour**, so a 110k-asset
+  library drains in roughly four days of background work, newest first.
+- Model load is ~3 s per invocation, so keep `--batch` well above 1: batches of
+  24 amortise it to nothing.
+
 ## Tests
 
 ```bash
