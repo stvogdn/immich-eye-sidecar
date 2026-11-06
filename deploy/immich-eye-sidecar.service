@@ -6,8 +6,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=sogden1
-Group=sogden1
+# Run as the account that owns ~/.local/bin/desertant and its model cache.
+User=immich-eye
+Group=immich-eye
 EnvironmentFile=/etc/immich-eye/env
 WorkingDirectory=/opt/immich-eye
 ExecStart=/usr/bin/python3 /opt/immich-eye/eye_sidecar.py --once --limit 400

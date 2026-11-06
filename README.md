@@ -29,7 +29,7 @@ The CLI and model weights are Desert Ant Labs' own — see
 ## Run
 
 ```bash
-export IMMICH_URL=https://immich.chipmunk-bramble.ts.net
+export IMMICH_URL=https://immich.example.com
 export IMMICH_API_KEY_FILE=/etc/immich-eye/api-key
 export STATE_DB=/var/lib/immich-eye/state.db
 export PATH="$HOME/.local/bin:$PATH"
@@ -103,13 +103,14 @@ monitor; a failed run pushes `down`).
 - **Batching.** Model load dominates inference (≈3 s per process vs ≈0.3 s per
   photo), so each `desertant eye a.jpg b.jpg … --json` call covers a whole batch
   and returns one JSON object per file.
-- **State.** SQLite records `asset_id → updatedAt, tags, scores`. An asset is
-  skipped when its `updatedAt` matches, so a nightly pass only touches new or
-  edited photos. `--force` overrides.
+- **State.** SQLite records `asset_id → checksum, tags, scores`. An asset is
+  skipped when its checksum matches, so a pass only touches new or replaced
+  photos. Do not key on `updatedAt`: writing a tag bumps it in Immich, so an
+  `updatedAt` key makes every asset look new again forever. `--force` overrides.
 - **Bulk tag writes.** Assets are grouped per tag and attached with one
   `PUT /api/tags/{id}/assets` per tag batch, not one call per asset.
 
-## Deploy (pluto, where Immich runs)
+## Deploy (on the host where Immich runs)
 
 ```bash
 sudo mkdir -p /opt/immich-eye /var/lib/immich-eye
@@ -120,11 +121,13 @@ sudo systemctl daemon-reload && sudo systemctl enable --now immich-eye-sidecar.t
 sudo journalctl -u immich-eye-sidecar -n 50 --no-pager
 ```
 
-The unit runs as the `sogden1` user so it inherits `~/.local/bin/desertant`
-and its cached weights; `STATE_DB=/var/lib/immich-eye/state.db` must be writable
-by that user.
+The unit runs as the user that installed `desertant`, so it inherits
+`~/.local/bin/desertant` and the cached model weights; `STATE_DB=/var/lib/immich-eye/state.db`
+must be writable by that user. Set `User=`/`Group=` in the unit to match. `README`
+ships with `User=immich-eye`; change it to your own account if the CLI lives in
+your home directory.
 
-## Throughput (measured on pluto, 2026-11-06)
+## Throughput (measured on an x86 host, 2026-11-06)
 
 - **≈2.75 s per photo** single-threaded, CPU only (LiteRT build, no GPU): 40
   photos in 110 s end to end, including Immich API round trips and 60-ish tag
@@ -153,6 +156,6 @@ cd tests && python3 -m unittest -v
 - Previews are the model's input, so a 1.5 MP preview is plenty — Eye resizes
   internally. Larger inputs cost time, not accuracy.
 - `KEEP_ALIVE`/rate limits: Immich serves previews from its own cache; a
-  full 110k-asset pass is mostly disk reads on pluto.
+  full pass over a large library is mostly disk reads on the Immich host.
 - If `desertant` starts returning non-zero, check `ffmpeg -version` first: the
   binary is installed but image decoding fails without it.
