@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Eye -> Immich sidecar pass
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=20min
+AccuracySec=1min
+Persistent=true
+Unit=immich-eye-sidecar.service
+
+[Install]
+WantedBy=timers.target

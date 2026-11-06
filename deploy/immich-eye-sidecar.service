@@ -1,0 +1,17 @@
+[Unit]
+Description=Eye -> Immich sidecar (tags assets with Desert Ant Labs Eye)
+Documentation=https://github.com/stvogdn/immich-eye-sidecar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sogden1
+Group=sogden1
+EnvironmentFile=/etc/immich-eye/env
+WorkingDirectory=/opt/immich-eye
+ExecStart=/usr/bin/python3 /opt/immich-eye/eye_sidecar.py --once
+TimeoutStartSec=7200
+Nice=10
+IOSchedulingClass=idle
+# One pass per start; the timer decides how often.
